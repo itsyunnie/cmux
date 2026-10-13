@@ -21,6 +21,8 @@ final class BrowserHistoryStarts {
     private var waiting: [String: Waiting] = [:]
     /// How each held page started, by tab id (`debug.browser.page_status` `history_start`).
     var outcomes: [String: String] = [:]
+    /// Tabs whose new page restored its engine's own history, until `takeEngineRestored`.
+    private var engineRestored: Set<String> = []
 
     /// The blank page for restored tab `tab` at `url`, waiting for its saved history; nil when
     /// the tab opens as before: a page the user opened now, a remote machine's tab, a
@@ -38,6 +40,40 @@ final class BrowserHistoryStarts {
         let page = cache.webKit.makeWebKitTab(id: BrowserTabID(rawValue: key), profile: cache.browserProfile?(key) ?? .default)
         service.historyStarts.hold(page, url: url, tabID: key)
         return cache.install(page, for: key)
+    }
+
+    /// `configuration` for restored Chromium tab `tab`, with the navigation state saved with its
+    /// history when it was saved at the page's address (cx-il4fv): Chromium restores its back list
+    /// and page state, and loads the address itself when it cannot. Tabs that open as before, as
+    /// in `page`, and pages with a local file in their history (Chromium's file access is not
+    /// bounded to a folder) keep `configuration`.
+    static func chromium(_ tab: TabModel, _ configuration: BrowserTabConfiguration, cache: TabContentCache) async -> BrowserTabConfiguration {
+        let service = cache.browserTabs, key = tab.id, daemon = service.daemon(for: tab)
+        guard configuration.restoreState == nil, configuration.machineStore == nil, let url = configuration.initialURL,
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""), MachineBrowserRecord(url: url) == nil,
+              tab.isFrontendOwned, !service.isIncognitoTab(key), !service.wasOpenedHere(tab), daemon.isLocal,
+              daemon.supports(DaemonCapabilities.shared.frontendBrowserHistory) else { return configuration }
+        let saved = await service.fetchHistory(daemon, tab.surface)
+        guard let state = BrowserHistoryWriter.restoreState(saved, at: url, engine: .cef),
+              !(saved?.entries ?? []).contains(where: { URL(string: $0.url)?.isFileURL ?? true }) else {
+            service.historyStarts.outcomes[key] = saved?.engineState == nil ? "address-no-state" : "address-file-access"
+            return configuration
+        }
+        var restored = configuration
+        restored.restoreState = state
+        service.historyStarts.outcomes[key] = "engine"
+        service.historyStarts.engineRestored.insert(key)
+        return restored
+    }
+
+    /// True once after tab `tabID`'s new page restored its engine's own history; a Chromium page
+    /// then also scrolls to the position saved at quit once it loads (WebKit's did at its start).
+    func takeEngineRestored(_ tabID: String, page: any BrowserTab, saved: FrontendBrowserHistory?) -> Bool {
+        guard engineRestored.remove(tabID) != nil else { return false }
+        if page.engineKind == .cef, let saved, saved.entries.indices.contains(saved.index), let y = saved.entries[saved.index].scrollY {
+            BrowserRestoreScroll.onLoad(page, to: y)
+        }
+        return true
     }
 
     func hold(_ page: WebKitTab, url: URL, tabID: String) {
@@ -65,7 +101,11 @@ final class BrowserHistoryStarts {
         }
         let files = BrowserHistoryWriter.keepsFileAccess(saved?.entries.compactMap { URL(string: $0.url) } ?? [], shown: entry.url)
         if let state = BrowserHistoryWriter.restoreState(saved, at: entry.url, engine: .webkit), files {
-            guard entry.url.isFileURL else { return restore(page, state, saved: saved, at: entry.url, tabID: tabID) }
+            guard entry.url.isFileURL else {
+                guard restore(page, state, saved: saved, at: entry.url, tabID: tabID) else { return false }
+                engineRestored.insert(tabID)
+                return true
+            }
             // A local page first loads with read access to its folder, which its restored entries
             // (all in that folder) then share; restored without it, WebKit would read them with
             // access to every file. The restore waits for that load to commit, so it replaces the
@@ -73,6 +113,9 @@ final class BrowserHistoryStarts {
             // before the page's scripts run (Back pressed then would find no entries).
             page.load(entry.url)
             outcomes[tabID] = "engine-waiting-file"
+            // No saved entries on top: a local page's could not navigate (WebKit refuses a
+            // scripted replace to a file), whether or not the restore takes.
+            engineRestored.insert(tabID)
             Task { [weak self, weak page] in
                 // The load's phase, not its address: WebKit reports the address as the load is
                 // asked for, before it starts.
